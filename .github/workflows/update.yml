@@ -11,8 +11,8 @@ on:
 # CONFIGURATION - EDIT THESE DATES
 # ============================================
 env:
-  COMPETITION_START: "2025-12-18"
-  COMPETITION_END: "2025-12-31"
+  COMPETITION_START: "2024-12-18"
+  COMPETITION_END: "2025-01-18"
   API_URL: "https://api.torn.com/v2/faction/contributors?stat=gymenergy&cat=current&comment=Olu"
 # ============================================
 
@@ -43,8 +43,6 @@ jobs:
           # Check if API key exists
           if [ -z "$API_KEY" ]; then
             echo "ERROR: TORN_API_KEY secret is not set!"
-            echo "Go to Settings > Secrets and variables > Actions"
-            echo "Add a secret named TORN_API_KEY with your API key"
             exit 1
           fi
           echo "✓ API key found"
@@ -66,48 +64,85 @@ jobs:
           fi
           echo ""
           
-          # Fetch data from API (unless competition ended)
+          # Fetch current data from API
           if [ "$SKIP_FETCH" = false ]; then
-            echo "Fetching data from Torn API..."
-            HTTP_CODE=$(curl -s -w "%{http_code}" -o data.json "${API_URL}&key=${API_KEY}")
+            echo "Fetching current data from Torn API..."
+            HTTP_CODE=$(curl -s -w "%{http_code}" -o current.json "${API_URL}&key=${API_KEY}")
             
             if [ "$HTTP_CODE" != "200" ]; then
               echo "ERROR: API request failed with HTTP code $HTTP_CODE"
-              if [ -f data.json ]; then
-                echo "Response body:"
-                cat data.json
+              if [ -f current.json ]; then
+                cat current.json
               fi
               exit 1
             fi
             echo "✓ API request successful (HTTP $HTTP_CODE)"
             
-            # Check if response is valid JSON
-            if ! jq empty data.json 2>/dev/null; then
-              echo "ERROR: Invalid JSON response from API"
-              echo "Response content:"
-              cat data.json
+            if ! jq empty current.json 2>/dev/null; then
+              echo "ERROR: Invalid JSON response"
+              cat current.json
               exit 1
             fi
             echo "✓ Valid JSON received"
-            
-            # Check if contributors exist
-            CONTRIBUTOR_COUNT=$(jq '.contributors | length' data.json)
-            if [ "$CONTRIBUTOR_COUNT" -eq 0 ]; then
-              echo "WARNING: No contributors found in API response"
-            else
-              echo "✓ Found $CONTRIBUTOR_COUNT contributors"
-            fi
-            echo ""
           else
-            # Use existing data if competition ended
-            if [ ! -f data.json ]; then
-              echo "ERROR: Competition ended but no previous data.json found"
+            if [ ! -f current.json ]; then
+              echo "ERROR: Competition ended but no current.json found"
               exit 1
             fi
-            echo "Using existing data.json (competition ended)"
+            echo "Using existing current.json"
           fi
           
+          # Check if baseline exists, if not create it
+          if [ ! -f baseline.json ]; then
+            echo ""
+            echo "================================================"
+            echo "⚠️  NO BASELINE FOUND - CREATING INITIAL SNAPSHOT"
+            echo "================================================"
+            echo "This will be your starting point for the competition."
+            echo "All progress will be measured from these values."
+            echo ""
+            
+            cp current.json baseline.json
+            
+            echo "Baseline created with $(jq '.contributors | length' baseline.json) contributors:"
+            jq -r '.contributors | sort_by(-.value) | .[:5][] | "  \(.username): \(.value)"' baseline.json
+            echo ""
+            echo "⚠️  If these values look wrong, delete baseline.json and run again"
+            echo "================================================"
+          else
+            echo "✓ Baseline found"
+          fi
+          
+          # Calculate differences
+          echo ""
+          echo "Calculating progress (current - baseline)..."
+          
+          jq -n '
+            ($baseline | INDEX(.contributors[]; .id)) as $base |
+            ($current | INDEX(.contributors[]; .id)) as $curr |
+            
+            [
+              $curr | to_entries[] | 
+              {
+                id: (.value.id),
+                username: (.value.username),
+                baseline: (($base[.key] // {value: 0}).value),
+                current: (.value.value),
+                progress: ((.value.value) - (($base[.key] // {value: 0}).value)),
+                in_faction: (.value.in_faction)
+              }
+            ] | sort_by(-.progress)
+          ' \
+            --slurpfile baseline baseline.json \
+            --slurpfile current current.json > progress.json
+          
+          TOTAL_CONTRIBUTORS=$(jq 'length' progress.json)
+          ACTIVE_CONTRIBUTORS=$(jq '[.[] | select(.progress > 0)] | length' progress.json)
+          echo "✓ Calculated progress for $TOTAL_CONTRIBUTORS contributors"
+          echo "✓ $ACTIVE_CONTRIBUTORS have positive progress"
+          
           # Generate HTML page
+          echo ""
           echo "Building HTML page..."
           
           cat > index.html << 'HTMLEOF'
@@ -125,13 +160,14 @@ jobs:
                 min-height: 100vh;
                 padding: 20px;
               }
-              .container { max-width: 900px; margin: 0 auto; }
+              .container { max-width: 1000px; margin: 0 auto; }
               .header {
                 text-align: center;
                 color: white;
                 margin-bottom: 30px;
               }
               .header h1 { font-size: 2.5em; margin-bottom: 10px; }
+              .header p { font-size: 1.1em; opacity: 0.9; margin-top: 5px; }
               .status {
                 background: STATUS_COLOR_PLACEHOLDER;
                 padding: 10px 20px;
@@ -167,6 +203,8 @@ jobs:
               .username { font-size: 1.4em; font-weight: bold; margin-bottom: 5px; }
               .energy { font-size: 1.8em; color: #667eea; font-weight: bold; margin-top: 5px; }
               .podium-item:first-child .energy { color: #fff; }
+              .baseline { font-size: 0.85em; color: #666; margin-top: 5px; }
+              .podium-item:first-child .baseline { color: rgba(255,255,255,0.8); }
               .table-container {
                 background: white;
                 border-radius: 15px;
@@ -179,7 +217,9 @@ jobs:
               th { background: #f8f9fa; font-weight: bold; color: #667eea; position: sticky; top: 0; }
               tr:hover { background: #f8f9fa; }
               .rank-col { width: 80px; text-align: center; font-weight: bold; font-size: 1.1em; }
-              .energy-col { text-align: right; font-weight: bold; color: #667eea; }
+              .number-col { text-align: right; font-weight: bold; }
+              .progress-col { color: #27ae60; }
+              .baseline-col { color: #95a5a6; font-size: 0.9em; }
               .updated { 
                 text-align: center; 
                 color: white; 
@@ -189,11 +229,11 @@ jobs:
                 padding: 10px;
                 border-radius: 10px;
               }
-              .zero-energy { opacity: 0.5; }
+              .zero-progress { opacity: 0.5; }
               @media (max-width: 768px) {
                 .header h1 { font-size: 1.8em; }
                 .podium { grid-template-columns: 1fr; }
-                th, td { padding: 10px 5px; font-size: 0.9em; }
+                th, td { padding: 10px 5px; font-size: 0.85em; }
                 .rank { font-size: 2em; }
                 .username { font-size: 1.1em; }
                 .energy { font-size: 1.3em; }
@@ -203,7 +243,8 @@ jobs:
           <body>
             <div class="container">
               <div class="header">
-                <h1>🏋️ Gym Energy Leaderboard</h1>
+                <h1>🏋️ Gym Energy Competition</h1>
+                <p>Tracking progress from competition start</p>
                 <div class="status">STATUS_PLACEHOLDER</div>
                 <div class="competition-dates">DATES_PLACEHOLDER</div>
               </div>
@@ -218,7 +259,9 @@ jobs:
                     <tr>
                       <th class="rank-col">Rank</th>
                       <th>Username</th>
-                      <th class="energy-col">Energy Spent</th>
+                      <th class="number-col">Progress</th>
+                      <th class="number-col">Baseline</th>
+                      <th class="number-col">Current</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -238,73 +281,67 @@ jobs:
           
           echo "✓ HTML template created"
           
-          # Sort contributors by energy (descending) and build HTML
-          echo "Processing contributor data..."
+          # Build HTML from progress data
+          echo "Processing leaderboard data..."
           PODIUM=""
           TABLE=""
           RANK=1
           MEDALS=("🥇" "🥈" "🥉")
-          ACTIVE_CONTRIBUTORS=0
           
-          # Process each contributor
           while IFS= read -r row; do
             USERNAME=$(echo "$row" | jq -r '.username')
-            VALUE=$(echo "$row" | jq -r '.value')
+            PROGRESS=$(echo "$row" | jq -r '.progress')
+            BASELINE=$(echo "$row" | jq -r '.baseline')
+            CURRENT=$(echo "$row" | jq -r '.current')
             
-            # Skip if invalid data
             if [ -z "$USERNAME" ] || [ "$USERNAME" = "null" ]; then
               continue
             fi
             
-            # Format number with commas
-            FORMATTED=$(printf "%'d" $VALUE 2>/dev/null || echo $VALUE)
+            # Format numbers
+            PROGRESS_FMT=$(printf "%'d" $PROGRESS 2>/dev/null || echo $PROGRESS)
+            BASELINE_FMT=$(printf "%'d" $BASELINE 2>/dev/null || echo $BASELINE)
+            CURRENT_FMT=$(printf "%'d" $CURRENT 2>/dev/null || echo $CURRENT)
             
-            # Track active contributors (value > 0)
-            if [ "$VALUE" -gt 0 ]; then
-              ACTIVE_CONTRIBUTORS=$((ACTIVE_CONTRIBUTORS + 1))
-            fi
-            
-            # Add to podium (top 3 with energy > 0)
-            if [ $RANK -le 3 ] && [ "$VALUE" -gt 0 ]; then
+            # Add to podium (top 3 with progress > 0)
+            if [ $RANK -le 3 ] && [ "$PROGRESS" -gt 0 ]; then
               MEDAL="${MEDALS[$RANK-1]}"
               PODIUM+="<div class=\"podium-item\">"
               PODIUM+="<div class=\"rank\">$MEDAL</div>"
               PODIUM+="<div class=\"username\">$USERNAME</div>"
-              PODIUM+="<div class=\"energy\">$FORMATTED</div>"
+              PODIUM+="<div class=\"energy\">+$PROGRESS_FMT</div>"
+              PODIUM+="<div class=\"baseline\">Started at: $BASELINE_FMT</div>"
               PODIUM+="</div>"
             fi
             
-            # Add to table (mark zero energy differently)
-            if [ "$VALUE" -eq 0 ]; then
-              TABLE+="<tr class=\"zero-energy\">"
+            # Add to table
+            if [ "$PROGRESS" -eq 0 ]; then
+              TABLE+="<tr class=\"zero-progress\">"
             else
               TABLE+="<tr>"
             fi
             TABLE+="<td class=\"rank-col\">$RANK</td>"
             TABLE+="<td>$USERNAME</td>"
-            TABLE+="<td class=\"energy-col\">$FORMATTED</td>"
+            TABLE+="<td class=\"number-col progress-col\">+$PROGRESS_FMT</td>"
+            TABLE+="<td class=\"number-col baseline-col\">$BASELINE_FMT</td>"
+            TABLE+="<td class=\"number-col\">$CURRENT_FMT</td>"
             TABLE+="</tr>"
             
             RANK=$((RANK + 1))
-          done < <(jq -c '.contributors | sort_by(-.value)[]' data.json)
+          done < <(jq -c '.[]' progress.json)
           
-          echo "✓ Processed $((RANK - 1)) total contributors"
-          echo "✓ $ACTIVE_CONTRIBUTORS active contributors (energy > 0)"
+          echo "✓ Processed $((RANK - 1)) contributors"
           
-          # Handle case where no contributors found
           if [ -z "$PODIUM" ]; then
-            PODIUM="<div class=\"podium-item\"><div class=\"username\">No data yet</div></div>"
-            echo "⚠️  No active contributors found"
+            PODIUM="<div class=\"podium-item\"><div class=\"username\">No progress yet</div></div>"
           fi
           
           if [ -z "$TABLE" ]; then
-            TABLE="<tr><td colspan=\"3\" style=\"text-align:center;\">No contributors found</td></tr>"
+            TABLE="<tr><td colspan=\"5\" style=\"text-align:center;\">No data</td></tr>"
           fi
           
-          # Calculate next update time
+          # Replace placeholders
           NEXT_UPDATE=$(date -u -d "+6 hours" "+%Y-%m-%d %H:%M UTC" 2>/dev/null || echo "In 6 hours")
-          
-          # Replace placeholders in HTML
           TIMESTAMP=$(date -u "+%Y-%m-%d %H:%M:%S UTC")
           DATES="$COMPETITION_START to $COMPETITION_END"
           
@@ -318,8 +355,8 @@ jobs:
           
           echo "✓ HTML page built successfully"
           echo ""
-          echo "Preview of top 3:"
-          jq -r '.contributors | sort_by(-.value) | .[:3][] | "  \(.username): \(.value)"' data.json || echo "  (none)"
+          echo "Preview of top 3 progress:"
+          jq -r '.[:3][] | "  \(.username): +\(.progress) (was \(.baseline), now \(.current))"' progress.json || echo "  (none)"
           
       - name: Commit and Push Changes
         run: |
@@ -331,7 +368,7 @@ jobs:
           git config user.name "GitHub Actions Bot"
           git config user.email "actions@github.com"
           
-          git add index.html data.json
+          git add index.html baseline.json current.json progress.json
           
           if git diff --staged --quiet; then
             echo "ℹ️  No changes to commit"
@@ -344,7 +381,4 @@ jobs:
           echo ""
           echo "================================================"
           echo "Update complete!"
-          echo "================================================"
-          echo "Your leaderboard is live at:"
-          echo "https://$(echo $GITHUB_REPOSITORY | tr '[:upper:]' '[:lower:]' | sed 's/\//.github.io\//')"
           echo "================================================"
